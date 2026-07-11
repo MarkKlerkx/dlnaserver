@@ -1,485 +1,344 @@
 #!/usr/bin/env bash
 #
-# setup-sacd-dlna.sh
+# setup-nvme-pi.sh
 #
-# Sets up the complete SACD DLNA server, with confirmation at every step:
-#   1. Install Docker + Docker Compose
-#   2. Create folder structure: /dlna/data, /dlna/logs, /dlna/isos
-#   3. Choose the data disk, format it, and mount it on /dlna/isos
-#   4. Generate docker-compose.yml (with a choice of image registry) and
-#      start the container
-#   5. Optimizations for the container itself (logging, ulimits, inotify)
-#   6. Fan tuning for the Raspberry Pi 5 Active Cooler
-#   7. Other recommended optimizations (TRIM, swappiness, log rotation)
+# End-to-end helper to get a fresh Raspberry Pi OS install working on an
+# NVMe drive behind a PCIe switch (e.g. Pimoroni NVMe Base Duo).
+#
+# Run this FROM the currently booted system (e.g. the SD card), targeting
+# a different, currently-inactive NVMe drive.
+#
+# What it does:
+#   1. Installs rpi-imager and its dependencies (incl. the libOpenGL fix
+#      needed to run rpi-imager --cli headless)
+#   2. Lets you pick the target disk and an OS image, then flashes it
+#      with `rpi-imager --cli --enable-writing-system-drives`
+#   3. Mounts the freshly-flashed boot + root partitions
+#   4. Adds the ASPM/power-management boot parameters to cmdline.txt
+#      (needed for NVMe behind a PCIe switch like the Base Duo)
+#   5. Enables SSH (flag file + direct systemd symlink)
+#   6. Sets a root password and allows root login over SSH
+#   7. If the CURRENTLY running system also sits behind an NVMe HAT/base,
+#      applies the same ASPM fix to its own cmdline.txt (so the running
+#      system stops fighting the same power-management issue too)
+#   8. Sets the EEPROM boot order so the target NVMe disk is tried first
+#      (non-interactively, via `rpi-eeprom-config --apply`)
+#   9. Cleans up all mounts, even on error
 #
 # Usage:
-#   sudo bash setup-sacd-dlna.sh
+#   sudo bash setup-nvme-pi.sh
 #
-set -uo pipefail
-
-# Prevent needrestart (present by default on Debian trixie / recent Raspberry
-# Pi OS) from popping up an interactive "which services to restart?" prompt
-# during apt installs below, which would otherwise make the script appear
-# to hang while it's actually waiting for input.
-export NEEDRESTART_MODE=a
-export DEBIAN_FRONTEND=noninteractive
+set -euo pipefail
 
 BOLD='\033[1m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-CYAN='\033[0;36m'
 NC='\033[0m'
 
-info()    { echo -e "${GREEN}==>${NC} $*"; }
-warn()    { echo -e "${YELLOW}!!${NC} $*"; }
-err()     { echo -e "${RED}ERROR:${NC} $*" >&2; }
-section() { echo; echo -e "${BOLD}${CYAN}### $* ###${NC}"; echo; }
-
-confirm() {
-  local prompt="$1"
-  local answer
-  read -rp "$(echo -e "${YELLOW}?${NC} ${prompt} [y/N]: ")" answer
-  [[ "${answer}" =~ ^[Yy]$ ]]
-}
+info()  { echo -e "${GREEN}==>${NC} $*"; }
+warn()  { echo -e "${YELLOW}!!${NC} $*"; }
+err()   { echo -e "${RED}ERROR:${NC} $*" >&2; }
 
 if [ "$(id -u)" -ne 0 ]; then
   err "This script must run as root. Use: sudo bash $0"
   exit 1
 fi
 
-echo -e "${BOLD}=== SACD DLNA Server Setup ===${NC}"
-echo "This script walks through 7 steps. At each step you'll first see what"
-echo "is about to happen, and you must explicitly confirm before it runs."
+MNT_BOOT="/mnt/nvme-boot-prep"
+MNT_ROOT="/mnt/nvme-root-prep"
+
+cleanup() {
+  info "Cleaning up / unmounting..."
+  umount "${MNT_ROOT}/dev" 2>/dev/null || true
+  umount "${MNT_ROOT}/proc" 2>/dev/null || true
+  umount "${MNT_ROOT}/sys" 2>/dev/null || true
+  umount "${MNT_BOOT}" 2>/dev/null || true
+  umount "${MNT_ROOT}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo
+echo -e "${BOLD}=== NVMe Raspberry Pi Setup Script ===${NC}"
 echo
 
-# =========================================================================
-# STEP 1: Install Docker
-# =========================================================================
-section "STEP 1: Install Docker + Docker Compose"
-
-if command -v docker >/dev/null 2>&1; then
-  info "Docker is already installed: $(docker --version)"
-else
-  echo "This installs Docker via the official docker.com install script"
-  echo "(curl -fsSL https://get.docker.com | sh), and enables the docker service."
-  if confirm "Install Docker now?"; then
-    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh
-    rm -f /tmp/get-docker.sh
-    systemctl enable --now docker
-    info "Docker installed: $(docker --version)"
-  else
-    err "Docker is required for the rest of this script. Stopping."
-    exit 1
-  fi
-fi
-
-if docker compose version >/dev/null 2>&1; then
-  info "Docker Compose plugin present: $(docker compose version)"
-else
-  warn "Docker Compose plugin not found, attempting to install it..."
-  apt update && apt install -y docker-compose-plugin
-fi
-
-# =========================================================================
-# STEP 2: Create folder structure
-# =========================================================================
-section "STEP 2: Create folder structure"
-
-echo "This creates the following folders (if not already present):"
-echo "    /dlna/data"
-echo "    /dlna/logs"
-echo "    /dlna/isos"
-if confirm "Create these folders?"; then
-  mkdir -p /dlna/data /dlna/logs /dlna/isos
-  info "Folders created under /dlna"
-  ls -la /dlna
-else
-  err "These folders are required for the rest of the script. Stopping."
-  exit 1
-fi
-
-# =========================================================================
-# STEP 3: Select, format and mount the data disk
-# =========================================================================
-section "STEP 3: Choose the data disk, format it and mount on /dlna/isos"
-
+# -------------------------------------------------------------------------
+# STEP 0: pick and confirm the target disk (used for both flashing and
+# for the post-flash configuration, so we only ask once)
+# -------------------------------------------------------------------------
 info "Current disks:"
 lsblk -f
 echo
 
-read -rp "Name of the data disk for the ISOs, without /dev/ (e.g. nvme0n1): " DATA_DISK
-DATA_DISK_PATH="/dev/${DATA_DISK}"
+read -rp "Target disk name, without /dev/ (e.g. nvme1n1): " DISK_NAME
+DISK_PATH="/dev/${DISK_NAME}"
 
-if [ ! -b "${DATA_DISK_PATH}" ]; then
-  err "${DATA_DISK_PATH} does not exist or is not a block device."
+if [ ! -b "${DISK_PATH}" ]; then
+  err "${DISK_PATH} does not exist or is not a block device."
   exit 1
 fi
 
 CURRENT_ROOT_SRC=$(findmnt -n -o SOURCE / || true)
 CURRENT_ROOT_DISK=$(lsblk -no PKNAME "${CURRENT_ROOT_SRC}" 2>/dev/null || true)
-if [ "${DATA_DISK}" = "${CURRENT_ROOT_DISK}" ]; then
-  err "That is the disk you are currently booted from! Choose the other (data) disk."
+if [ "${DISK_NAME}" = "${CURRENT_ROOT_DISK}" ]; then
+  err "That is the disk you are currently booted from! Choose a different one."
   exit 1
 fi
 
 echo
-info "Partitions on ${DATA_DISK_PATH}:"
-lsblk -f "${DATA_DISK_PATH}" || true
+info "Partitions currently on ${DISK_PATH}:"
+lsblk -f "${DISK_PATH}" || true
 echo
-warn "Everything on ${DATA_DISK_PATH} will be PERMANENTLY erased."
-read -rp "Type FORMAT to confirm this is the correct disk to wipe: " FORMAT_CONFIRM
-
-if [ "${FORMAT_CONFIRM}" != "FORMAT" ]; then
-  err "Not confirmed. Stopping without touching the disk."
+warn "Everything on ${DISK_PATH} will be ERASED by the imaging step."
+read -rp "Type YES to confirm this is the correct disk: " CONFIRM
+if [ "${CONFIRM}" != "YES" ]; then
+  warn "Cancelled by user."
   exit 1
 fi
 
-info "Unmounting any existing mounts on ${DATA_DISK_PATH} (if active)..."
-for part in $(lsblk -ln -o NAME "${DATA_DISK_PATH}" | tail -n +2); do
-  umount "/dev/${part}" 2>/dev/null || true
-done
+# -------------------------------------------------------------------------
+# STEP 1: install rpi-imager + dependencies
+# -------------------------------------------------------------------------
+echo
+info "Installing rpi-imager and dependencies..."
+apt update
+apt install -y rpi-imager
 
-info "Wiping disk and creating a new GPT partition table..."
-wipefs -a "${DATA_DISK_PATH}"
-parted -s "${DATA_DISK_PATH}" mklabel gpt
-parted -s "${DATA_DISK_PATH}" mkpart primary ext4 0% 100%
+# Fix for: "error while loading shared libraries: libOpenGL.so.0"
+# which happens when running rpi-imager --cli on a headless/minimal system.
+if ! ldconfig -p | grep -q libOpenGL.so.0; then
+  info "Installing libopengl0 (fixes libOpenGL.so.0 error in headless CLI mode)..."
+  apt install -y libopengl0 || apt install -y libgl1 libglx-mesa0 || true
+else
+  info "libOpenGL.so.0 already present, skipping."
+fi
 
-partprobe "${DATA_DISK_PATH}" 2>/dev/null || true
+# -------------------------------------------------------------------------
+# STEP 2: choose an OS image and flash it
+# -------------------------------------------------------------------------
+echo
+info "Choose the OS image to flash."
+echo "  You can either paste a direct image URL/path, or press Enter to use"
+echo "  the default Raspberry Pi OS Lite (64-bit) latest release."
+echo
+read -rp "Image URL or local path [default: RPi OS Lite 64-bit]: " IMAGE_SRC
+if [ -z "${IMAGE_SRC}" ]; then
+  IMAGE_SRC="https://downloads.raspberrypi.com/raspios_lite_arm64_latest"
+fi
+
+echo
+info "About to flash:"
+echo "    Image : ${IMAGE_SRC}"
+echo "    Target: ${DISK_PATH}"
+echo
+read -rp "Type FLASH to start writing now: " FLASH_CONFIRM
+if [ "${FLASH_CONFIRM}" != "FLASH" ]; then
+  warn "Cancelled by user before flashing."
+  exit 1
+fi
+
+info "Flashing image, this can take a few minutes..."
+rpi-imager --cli --enable-writing-system-drives "${IMAGE_SRC}" "${DISK_PATH}"
+info "Flashing complete."
+
+# Give the kernel a moment to re-read the new partition table
+partprobe "${DISK_PATH}" 2>/dev/null || true
 udevadm settle 2>/dev/null || true
 sleep 2
 
-DATA_PART=$(lsblk -ln -o NAME "${DATA_DISK_PATH}" | sed -n '2p')
-DATA_PART_PATH="/dev/${DATA_PART}"
+# -------------------------------------------------------------------------
+# STEP 3: mount the freshly written boot + root partitions
+# -------------------------------------------------------------------------
+echo
+info "Partitions on ${DISK_PATH} after flashing:"
+lsblk -f "${DISK_PATH}"
+echo
 
-if [ -z "${DATA_PART}" ] || [ ! -b "${DATA_PART_PATH}" ]; then
-  err "Could not find the new partition on ${DATA_DISK_PATH}."
+BOOT_PART=$(lsblk -ln -o NAME,FSTYPE "${DISK_PATH}" | awk '$2=="vfat"{print $1; exit}')
+ROOT_PART=$(lsblk -ln -o NAME,FSTYPE "${DISK_PATH}" | awk '$2=="ext4"{print $1; exit}')
+
+if [ -z "${BOOT_PART}" ] || [ -z "${ROOT_PART}" ]; then
+  warn "Could not auto-detect boot/root partitions."
+  lsblk "${DISK_PATH}"
+  read -rp "Boot partition name (vfat), e.g. ${DISK_NAME}p1: " BOOT_PART
+  read -rp "Root partition name (ext4), e.g. ${DISK_NAME}p2: " ROOT_PART
+fi
+
+BOOT_DEV="/dev/${BOOT_PART}"
+ROOT_DEV="/dev/${ROOT_PART}"
+
+info "Boot partition: ${BOOT_DEV}"
+info "Root partition: ${ROOT_DEV}"
+echo
+
+mkdir -p "${MNT_BOOT}" "${MNT_ROOT}"
+mount "${BOOT_DEV}" "${MNT_BOOT}"
+mount "${ROOT_DEV}" "${MNT_ROOT}"
+
+# -------------------------------------------------------------------------
+# STEP 4: ASPM / power-management boot parameters
+# -------------------------------------------------------------------------
+CMDLINE="${MNT_BOOT}/cmdline.txt"
+ASPM_PARAMS="nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off"
+
+if [ ! -f "${CMDLINE}" ]; then
+  err "cmdline.txt not found on ${MNT_BOOT}. Wrong partition?"
   exit 1
 fi
 
-info "New partition: ${DATA_PART_PATH}"
-info "Formatting as ext4 with label 'isos'..."
-mkfs.ext4 -F -L isos "${DATA_PART_PATH}"
-
-info "Mounting on /dlna/isos..."
-mount "${DATA_PART_PATH}" /dlna/isos
-
-DATA_UUID=$(blkid -s UUID -o value "${DATA_PART_PATH}")
-if [ -z "${DATA_UUID}" ]; then
-  err "Could not find a UUID for ${DATA_PART_PATH}, skipping fstab entry."
+if grep -q "pcie_aspm=off" "${CMDLINE}"; then
+  info "ASPM parameters already present in cmdline.txt, nothing to do."
 else
-  if grep -q "${DATA_UUID}" /etc/fstab; then
-    info "fstab already contains an entry for this UUID, skipping."
-  else
-    # noatime/nodiratime: fewer unnecessary writes to the SSD while reading
-    # ISOs / scanning the library (see step 7 for more SSD tuning)
-    echo "UUID=${DATA_UUID}  /dlna/isos  ext4  defaults,noatime,nodiratime,nofail  0  2" >> /etc/fstab
-    info "Entry added to /etc/fstab (with noatime to reduce write overhead)"
-  fi
+  sed -i "s/\$/ ${ASPM_PARAMS}/" "${CMDLINE}"
+  info "ASPM parameters added to cmdline.txt"
 fi
 
-df -h /dlna/isos
-info "Data disk ready and mounted on /dlna/isos"
+# -------------------------------------------------------------------------
+# STEP 5: enable SSH
+# -------------------------------------------------------------------------
+touch "${MNT_BOOT}/ssh"
+info "SSH flag file created (enables sshd on first boot)"
 
-# =========================================================================
-# STEP 4: Choose image source and generate docker-compose.yml
-# =========================================================================
-section "STEP 4: Choose image source, generate docker-compose.yml and start"
+mkdir -p "${MNT_ROOT}/etc/systemd/system/multi-user.target.wants"
+if [ -f "${MNT_ROOT}/lib/systemd/system/ssh.service" ]; then
+  ln -sf /lib/systemd/system/ssh.service \
+    "${MNT_ROOT}/etc/systemd/system/multi-user.target.wants/ssh.service"
+  info "ssh.service enabled directly via systemd symlink"
+else
+  warn "ssh.service not found in image, skipping symlink step."
+fi
 
-DEFAULT_IMAGE="markklerkx/sacdlibrary:latest"
-
-echo "Which image source do you want to use for the SACD Library container?"
-echo "  1) Docker Hub (default): ${DEFAULT_IMAGE}"
-echo "  2) Custom registry (e.g. your own local registry, for faster pulls)"
+# -------------------------------------------------------------------------
+# STEP 6: root password + allow root SSH login
+# -------------------------------------------------------------------------
 echo
-read -rp "Choice [1/2, default 1]: " REGISTRY_CHOICE
-REGISTRY_CHOICE="${REGISTRY_CHOICE:-1}"
-
-if [ "${REGISTRY_CHOICE}" = "2" ]; then
+info "Set a root password for the new installation"
+while true; do
+  read -rsp "New root password: " ROOTPW
   echo
-  echo "Enter the full image reference, including your registry host."
-  echo "Example: registry.local:5000/markklerkx/sacdlibrary:latest"
-  read -rp "Image reference: " CUSTOM_IMAGE
-  if [ -z "${CUSTOM_IMAGE}" ]; then
-    warn "No image reference entered, falling back to Docker Hub default."
-    IMAGE="${DEFAULT_IMAGE}"
-  else
-    IMAGE="${CUSTOM_IMAGE}"
+  read -rsp "Confirm password: " ROOTPW2
+  echo
+  if [ "${ROOTPW}" = "${ROOTPW2}" ] && [ -n "${ROOTPW}" ]; then
+    break
   fi
-else
-  IMAGE="${DEFAULT_IMAGE}"
-fi
+  warn "Passwords do not match or are empty, try again."
+done
 
-info "Using image: ${IMAGE}"
+# Password is piped via stdin to chpasswd, not passed as an argument,
+# so it never shows up in the process list (ps aux) of this system.
+printf '%s:%s\n' root "${ROOTPW}" | chroot "${MNT_ROOT}" chpasswd
+chroot "${MNT_ROOT}" passwd -u root || true
+unset ROOTPW ROOTPW2
+info "Root password set and root account unlocked"
 
-COMPOSE_FILE="/dlna/docker-compose.yml"
-
-echo
-echo "This will write the following compose file to ${COMPOSE_FILE}:"
-echo
-cat <<PREVIEW
-services:
-  sacd-dlna:
-    image: ${IMAGE}
-    container_name: sacd-dlna
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /dlna/data:/data
-      - /dlna/isos:/media/isos
-      - /dlna/logs:/var/log/sacd-dlna
-    environment:
-      - SACD_ISO_DIR=/media/isos
-      - SACD_DATA_DIR=/data
-      - SACD_DB_PATH=/data/library.db
-      - SACD_PORT=8080
-      - SACD_UPNP_PORT=8200
-      - SACD_LOG_DIR=/var/log/sacd-dlna
-      - SACD_AUTO_SCAN_ENABLED=true
-      - SACD_AUTO_SCAN_INTERVAL_SEC=3600
-      - TZ=Europe/Amsterdam
-PREVIEW
-echo
-warn "Note: network mode is 'host' — required for UPnP/DLNA discovery (SSDP"
-warn "broadcasts don't work reliably behind Docker's default bridge network)."
-
-if confirm "Write this compose file and start the container?"; then
-  cat > "${COMPOSE_FILE}" <<EOF
-services:
-  sacd-dlna:
-    image: ${IMAGE}
-    container_name: sacd-dlna
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /dlna/data:/data
-      - /dlna/isos:/media/isos
-      - /dlna/logs:/var/log/sacd-dlna
-    environment:
-      - SACD_ISO_DIR=/media/isos
-      - SACD_DATA_DIR=/data
-      - SACD_DB_PATH=/data/library.db
-      - SACD_PORT=8080
-      - SACD_UPNP_PORT=8200
-      - SACD_LOG_DIR=/var/log/sacd-dlna
-      - SACD_AUTO_SCAN_ENABLED=true
-      - SACD_AUTO_SCAN_INTERVAL_SEC=3600
-      - TZ=Europe/Amsterdam
+mkdir -p "${MNT_ROOT}/etc/ssh/sshd_config.d"
+cat > "${MNT_ROOT}/etc/ssh/sshd_config.d/99-allow-root.conf" <<'EOF'
+PermitRootLogin yes
+PasswordAuthentication yes
 EOF
-  info "Compose file written to ${COMPOSE_FILE}"
+info "SSH password login for root allowed (via sshd_config.d/99-allow-root.conf)"
 
-  info "Pulling image and starting container (this may take a while)..."
-  (cd /dlna && docker compose pull && docker compose up -d)
-  info "Container started. Status:"
-  docker ps --filter "name=sacd-dlna"
-else
-  warn "Skipped. You can do this manually later with:"
-  warn "  cd /dlna && docker compose up -d"
-fi
-
-# =========================================================================
-# STEP 5: Container optimizations
-# =========================================================================
-section "STEP 5: Optimizations for the SACD container"
-
-echo "This adds the following optimizations to ${COMPOSE_FILE}:"
-echo "  - logging: max 10MB per log file, max 3 files (prevents disk from"
-echo "    filling up with endlessly growing container logs)"
-echo "  - ulimits: nofile 65536 (needed because the library scan may need to"
-echo "    have thousands of ISO files open at the same time)"
-echo "  - increase fs.inotify.max_user_watches on the host (so the container"
-echo "    can keep detecting changes in a large ISO collection without errors)"
+# -------------------------------------------------------------------------
+# STEP 6b: create a regular user via userconf.txt
+#
+# Raspberry Pi OS (bookworm/trixie) blocks on an interactive "create a
+# user" wizard on the console at every boot until a non-root user exists
+# on the system. Setting only a root password does NOT satisfy this check.
+# Preseeding userconf.txt on the boot partition makes the first-boot
+# service create this user automatically and skips the wizard entirely.
+# -------------------------------------------------------------------------
 echo
+info "A regular (non-root) user is required, otherwise Raspberry Pi OS shows"
+info "an interactive 'create a user' wizard on the console at every boot,"
+info "which blocks the system from finishing boot until it's dismissed."
+read -rp "Username to create [default: pi]: " NEWUSER
+NEWUSER="${NEWUSER:-pi}"
 
-if confirm "Apply these optimizations?"; then
-  if [ -f "${COMPOSE_FILE}" ] && ! grep -q "ulimits:" "${COMPOSE_FILE}"; then
-    # Insert logging + ulimits under the service, preserving existing content
-    python3 - "${COMPOSE_FILE}" <<'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-
-addition = """    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-"""
-
-lines = content.splitlines(keepends=True)
-out = []
-inserted = False
-for line in lines:
-    out.append(line)
-    if line.strip().startswith("- TZ=Europe/Amsterdam") and not inserted:
-        out.append(addition)
-        inserted = True
-
-with open(path, "w") as f:
-    f.writelines(out)
-
-print("inserted" if inserted else "not-inserted")
-PYEOF
-    info "logging + ulimits added to ${COMPOSE_FILE}"
-  else
-    info "Optimizations are already present in the compose file, or the file doesn't exist yet."
+while true; do
+  read -rsp "Password for ${NEWUSER}: " USERPW
+  echo
+  read -rsp "Confirm password: " USERPW2
+  echo
+  if [ "${USERPW}" = "${USERPW2}" ] && [ -n "${USERPW}" ]; then
+    break
   fi
+  warn "Passwords do not match or are empty, try again."
+done
 
-  mkdir -p /etc/sysctl.d
-  cat > /etc/sysctl.d/99-dlna.conf <<'EOF'
-# Increased inotify watches: needed to live-track changes in a large ISO
-# library without hitting "no space left on device" inotify errors.
-fs.inotify.max_user_watches=1048576
-EOF
-  sysctl --system >/dev/null 2>&1
-  info "fs.inotify.max_user_watches increased to 1048576"
+USER_HASH=$(openssl passwd -6 "${USERPW}")
+unset USERPW USERPW2
+echo "${NEWUSER}:${USER_HASH}" > "${MNT_BOOT}/userconf.txt"
+info "userconf.txt written for user '${NEWUSER}' — the first-boot wizard will be skipped"
 
-  if [ -f "${COMPOSE_FILE}" ] && docker compose -f "${COMPOSE_FILE}" ps --status running 2>/dev/null | grep -q sacd-dlna; then
-    if confirm "Restart the container to apply the new compose settings?"; then
-      (cd /dlna && docker compose up -d)
-      info "Container restarted with the new settings."
-    fi
-  fi
-else
-  info "Container optimizations skipped."
-fi
-
-# =========================================================================
-# STEP 6: Fan tuning for the Raspberry Pi 5 Active Cooler
-# =========================================================================
-section "STEP 6: Fan tuning (Raspberry Pi 5 Active Cooler)"
-
-CONFIG_TXT="/boot/firmware/config.txt"
-
-echo "A 24/7 media server in an enclosed case benefits from a slightly"
-echo "earlier/more aggressive fan curve than the Raspberry Pi default,"
-echo "to avoid the CPU throttling during library scans/transcodes."
+# -------------------------------------------------------------------------
+# STEP 7: apply the same ASPM fix to the CURRENTLY running system, if it
+# also has NVMe devices visible (i.e. it is booted on the same NVMe
+# base/HAT and may hit the same power-management issue while it's up).
+# -------------------------------------------------------------------------
 echo
-echo "This adds the following lines to ${CONFIG_TXT} (under [all]):"
-cat <<'FANPREVIEW'
-    dtparam=cooling_fan=on
-    dtparam=fan_temp0=45000
-    dtparam=fan_temp0_hyst=5000
-    dtparam=fan_temp0_speed=60
-    dtparam=fan_temp1=55000
-    dtparam=fan_temp1_hyst=5000
-    dtparam=fan_temp1_speed=120
-    dtparam=fan_temp2=65000
-    dtparam=fan_temp2_hyst=5000
-    dtparam=fan_temp2_speed=180
-    dtparam=fan_temp3=75000
-    dtparam=fan_temp3_hyst=5000
-    dtparam=fan_temp3_speed=255
-FANPREVIEW
-echo
-warn "Only relevant if you're using the official Raspberry Pi 5 Active Cooler."
-warn "Using a different fan, or none at all? Skip this step."
+CURRENT_CMDLINE="/boot/firmware/cmdline.txt"
+OTHER_NVME_PRESENT=$(lsblk -dn -o NAME | grep -E '^nvme' | grep -v "^${DISK_NAME}$" || true)
 
-if confirm "Add this fan curve to config.txt?"; then
-  if [ ! -f "${CONFIG_TXT}" ]; then
-    err "${CONFIG_TXT} not found, skipping this step."
-  elif grep -q "^dtparam=fan_temp0=" "${CONFIG_TXT}"; then
-    info "A fan_temp0 setting already exists in config.txt, nothing changed."
-    warn "Adjust it manually in ${CONFIG_TXT} if needed."
-  else
-    cp "${CONFIG_TXT}" "${CONFIG_TXT}.bak-$(date +%Y%m%d%H%M%S)"
-    cat >> "${CONFIG_TXT}" <<'EOF'
-
-# --- SACD DLNA server: slightly earlier/more aggressive fan curve ---
-dtparam=cooling_fan=on
-dtparam=fan_temp0=45000
-dtparam=fan_temp0_hyst=5000
-dtparam=fan_temp0_speed=60
-dtparam=fan_temp1=55000
-dtparam=fan_temp1_hyst=5000
-dtparam=fan_temp1_speed=120
-dtparam=fan_temp2=65000
-dtparam=fan_temp2_hyst=5000
-dtparam=fan_temp2_speed=180
-dtparam=fan_temp3=75000
-dtparam=fan_temp3_hyst=5000
-dtparam=fan_temp3_speed=255
-EOF
-    info "Fan curve added to ${CONFIG_TXT} (backup saved alongside it)."
-    warn "Takes effect only after a reboot."
-  fi
-else
-  info "Fan tuning skipped."
-fi
-
-# =========================================================================
-# STEP 7: Other recommended optimizations
-# =========================================================================
-section "STEP 7: Other recommended optimizations"
-
-echo "This performs the following extra optimizations:"
-echo "  - enable fstrim.timer: periodic TRIM for both NVMe disks, good for"
-echo "    long-term SSD lifespan and write performance"
-echo "  - lower vm.swappiness to 10: avoids unnecessary swapping to the zram"
-echo "    swap (you have plenty of RAM; prefer keeping cache in RAM over swapping)"
-echo "  - set Docker's global log rotation in /etc/docker/daemon.json:"
-echo "    so future containers (not just sacd-dlna) can never write unlimited"
-echo "    logs and fill up the disk either"
-echo
-
-if confirm "Apply these extra optimizations?"; then
-  systemctl enable --now fstrim.timer
-  info "fstrim.timer enabled (weekly TRIM, default systemd schedule)"
-
-  if ! grep -q "vm.swappiness" /etc/sysctl.d/99-dlna.conf 2>/dev/null; then
-    echo "vm.swappiness=10" >> /etc/sysctl.d/99-dlna.conf
-    sysctl --system >/dev/null 2>&1
-    info "vm.swappiness set to 10"
-  else
-    info "vm.swappiness was already set, nothing changed."
-  fi
-
-  if [ ! -f /etc/docker/daemon.json ]; then
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-EOF
-    info "/etc/docker/daemon.json created with global log rotation"
-    if confirm "Restart Docker to apply this setting? (restarts all containers)"; then
-      systemctl restart docker
-      info "Docker restarted."
+if [ -n "${OTHER_NVME_PRESENT}" ] && [ -f "${CURRENT_CMDLINE}" ]; then
+  info "This running system also sees other NVMe device(s): ${OTHER_NVME_PRESENT}"
+  read -rp "Apply the same ASPM fix to THIS system's own cmdline.txt too? [y/N]: " APPLY_HERE
+  if [[ "${APPLY_HERE}" =~ ^[Yy]$ ]]; then
+    if grep -q "pcie_aspm=off" "${CURRENT_CMDLINE}"; then
+      info "ASPM parameters already present in the current system's cmdline.txt."
     else
-      warn "Don't forget later: sudo systemctl restart docker"
+      cp "${CURRENT_CMDLINE}" "${CURRENT_CMDLINE}.bak-$(date +%Y%m%d%H%M%S)"
+      sed -i "s/\$/ ${ASPM_PARAMS}/" "${CURRENT_CMDLINE}"
+      info "ASPM parameters added to the current system's cmdline.txt (backup saved alongside it)."
+      warn "This will take effect on this system's next reboot."
     fi
   else
-    info "/etc/docker/daemon.json already exists, not overwritten (avoids conflicts)."
+    info "Skipped patching the currently running system."
   fi
 else
-  info "Extra optimizations skipped."
+  info "No other NVMe devices visible on the running system, skipping this step."
 fi
 
-# =========================================================================
-# Done
-# =========================================================================
-section "Done"
-
-info "Summary:"
-echo "  - Docker             : $(command -v docker >/dev/null 2>&1 && echo present || echo NOT installed)"
-echo "  - /dlna folders       : $([ -d /dlna/isos ] && echo present || echo missing)"
-echo "  - Data disk mounted  : $(mountpoint -q /dlna/isos && echo yes || echo no) on /dlna/isos"
-echo "  - Compose file       : ${COMPOSE_FILE}"
-echo "  - Image used         : ${IMAGE:-not set}"
-echo "  - Container status   : $(docker ps --filter name=sacd-dlna --format '{{.Status}}' 2>/dev/null || echo 'not found')"
+# -------------------------------------------------------------------------
+# STEP 8: set the EEPROM boot order so the target NVMe disk boots first
+# -------------------------------------------------------------------------
 echo
-info "If config.txt or daemon.json were changed: a reboot is recommended"
-info "to fully apply all changes (fan curve, Docker logging)."
+info "Setting boot order so ${DISK_PATH} is tried first on next boot..."
+
+if ! command -v rpi-eeprom-config >/dev/null 2>&1; then
+  warn "rpi-eeprom-config not found, skipping automatic boot order change."
+  warn "Set it manually with: sudo raspi-config -> Advanced Options -> Boot Order"
+else
+  TMP_EEPROM_CONF=$(mktemp)
+  rpi-eeprom-config > "${TMP_EEPROM_CONF}" 2>/dev/null || echo "[all]" > "${TMP_EEPROM_CONF}"
+
+  # BOOT_ORDER=0xf416, read right-to-left: 6=NVMe, 1=SD, 4=USB, f=repeat.
+  # This tries NVMe first, falls back to SD, then USB, then restarts the cycle.
+  if grep -q "^BOOT_ORDER=" "${TMP_EEPROM_CONF}"; then
+    sed -i "s/^BOOT_ORDER=.*/BOOT_ORDER=0xf416/" "${TMP_EEPROM_CONF}"
+  else
+    echo "BOOT_ORDER=0xf416" >> "${TMP_EEPROM_CONF}"
+  fi
+
+  if rpi-eeprom-config --apply "${TMP_EEPROM_CONF}" >/dev/null 2>&1; then
+    info "Boot order updated (BOOT_ORDER=0xf416: NVMe -> SD -> USB)."
+    warn "This EEPROM change is applied on the NEXT reboot of this Pi."
+  else
+    warn "Automatic EEPROM update failed. Set it manually with:"
+    warn "  sudo raspi-config -> Advanced Options -> Boot Order -> NVMe/USB Boot"
+  fi
+  rm -f "${TMP_EEPROM_CONF}"
+fi
+
+# -------------------------------------------------------------------------
+# Done
+# -------------------------------------------------------------------------
+echo
+info "All steps completed successfully."
+warn "Root login over SSH is convenient for troubleshooting, but not ideal"
+warn "for permanent use. Consider creating a normal user later and removing"
+warn "/etc/ssh/sshd_config.d/99-allow-root.conf once everything is confirmed working."
+echo
+info "Just reboot this Pi now — it will boot from ${DISK_PATH} automatically:"
 echo "    sudo reboot"
 echo
-info "After the reboot, the web interface will be available at: http://<pi-ip>:8080"
+info "After that you should be able to log in with: ssh root@<pi-ip-address>"
