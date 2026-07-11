@@ -2,19 +2,27 @@
 #
 # setup-sacd-dlna.sh
 #
-# Zet de complete SACD DLNA-server op, met bevestiging per stap:
-#   1. Docker + Docker Compose installeren
-#   2. Mapstructuur aanmaken: /dlna/data, /dlna/logs, /dlna/isos
-#   3. Datadisk kiezen, formatteren en mounten op /dlna/isos
-#   4. docker-compose.yml genereren en de container starten
-#   5. Optimalisaties voor de container zelf (logging, ulimits, inotify)
-#   6. Fan-tuning voor de Raspberry Pi 5 Active Cooler
-#   7. Overige aanbevolen optimalisaties (TRIM, swappiness, log-rotatie)
+# Sets up the complete SACD DLNA server, with confirmation at every step:
+#   1. Install Docker + Docker Compose
+#   2. Create folder structure: /dlna/data, /dlna/logs, /dlna/isos
+#   3. Choose the data disk, format it, and mount it on /dlna/isos
+#   4. Generate docker-compose.yml (with a choice of image registry) and
+#      start the container
+#   5. Optimizations for the container itself (logging, ulimits, inotify)
+#   6. Fan tuning for the Raspberry Pi 5 Active Cooler
+#   7. Other recommended optimizations (TRIM, swappiness, log rotation)
 #
-# Gebruik:
+# Usage:
 #   sudo bash setup-sacd-dlna.sh
 #
 set -uo pipefail
+
+# Prevent needrestart (present by default on Debian trixie / recent Raspberry
+# Pi OS) from popping up an interactive "which services to restart?" prompt
+# during apt installs below, which would otherwise make the script appear
+# to hang while it's actually waiting for input.
+export NEEDRESTART_MODE=a
+export DEBIAN_FRONTEND=noninteractive
 
 BOLD='\033[1m'
 GREEN='\033[0;32m'
@@ -25,115 +33,115 @@ NC='\033[0m'
 
 info()    { echo -e "${GREEN}==>${NC} $*"; }
 warn()    { echo -e "${YELLOW}!!${NC} $*"; }
-err()     { echo -e "${RED}FOUT:${NC} $*" >&2; }
+err()     { echo -e "${RED}ERROR:${NC} $*" >&2; }
 section() { echo; echo -e "${BOLD}${CYAN}### $* ###${NC}"; echo; }
 
 confirm() {
   local prompt="$1"
   local answer
   read -rp "$(echo -e "${YELLOW}?${NC} ${prompt} [y/N]: ")" answer
-  [[ "${answer}" =~ ^[Jj][Aa]?$|^[Yy]$ ]]
+  [[ "${answer}" =~ ^[Yy]$ ]]
 }
 
 if [ "$(id -u)" -ne 0 ]; then
-  err "Dit script moet als root draaien. Gebruik: sudo bash $0"
+  err "This script must run as root. Use: sudo bash $0"
   exit 1
 fi
 
 echo -e "${BOLD}=== SACD DLNA Server Setup ===${NC}"
-echo "Dit script doorloopt 7 stappen. Bij elke stap zie je eerst wat er"
-echo "gaat gebeuren, en moet je expliciet bevestigen voordat het uitgevoerd wordt."
+echo "This script walks through 7 steps. At each step you'll first see what"
+echo "is about to happen, and you must explicitly confirm before it runs."
 echo
 
 # =========================================================================
-# STAP 1: Docker installeren
+# STEP 1: Install Docker
 # =========================================================================
-section "STAP 1: Docker + Docker Compose installeren"
+section "STEP 1: Install Docker + Docker Compose"
 
 if command -v docker >/dev/null 2>&1; then
-  info "Docker is al geïnstalleerd: $(docker --version)"
+  info "Docker is already installed: $(docker --version)"
 else
-  echo "Dit installeert Docker via het officiële installatiescript van docker.com"
-  echo "(curl -fsSL https://get.docker.com | sh), en zet de docker-service aan."
-  if confirm "Docker nu installeren?"; then
+  echo "This installs Docker via the official docker.com install script"
+  echo "(curl -fsSL https://get.docker.com | sh), and enables the docker service."
+  if confirm "Install Docker now?"; then
     curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
     sh /tmp/get-docker.sh
     rm -f /tmp/get-docker.sh
     systemctl enable --now docker
-    info "Docker geïnstalleerd: $(docker --version)"
+    info "Docker installed: $(docker --version)"
   else
-    err "Docker is vereist voor de rest van dit script. Stoppen."
+    err "Docker is required for the rest of this script. Stopping."
     exit 1
   fi
 fi
 
 if docker compose version >/dev/null 2>&1; then
-  info "Docker Compose plugin aanwezig: $(docker compose version)"
+  info "Docker Compose plugin present: $(docker compose version)"
 else
-  warn "Docker Compose plugin niet gevonden, probeer alsnog te installeren..."
+  warn "Docker Compose plugin not found, attempting to install it..."
   apt update && apt install -y docker-compose-plugin
 fi
 
 # =========================================================================
-# STAP 2: Mapstructuur aanmaken
+# STEP 2: Create folder structure
 # =========================================================================
-section "STAP 2: Mapstructuur aanmaken"
+section "STEP 2: Create folder structure"
 
-echo "Dit maakt de volgende mappen aan (indien nog niet aanwezig):"
+echo "This creates the following folders (if not already present):"
 echo "    /dlna/data"
 echo "    /dlna/logs"
 echo "    /dlna/isos"
-if confirm "Mappen aanmaken?"; then
+if confirm "Create these folders?"; then
   mkdir -p /dlna/data /dlna/logs /dlna/isos
-  info "Mappen aangemaakt onder /dlna"
+  info "Folders created under /dlna"
   ls -la /dlna
 else
-  err "Deze mappen zijn nodig voor de rest van het script. Stoppen."
+  err "These folders are required for the rest of the script. Stopping."
   exit 1
 fi
 
 # =========================================================================
-# STAP 3: Datadisk selecteren, formatteren en mounten
+# STEP 3: Select, format and mount the data disk
 # =========================================================================
-section "STAP 3: Datadisk kiezen, formatteren en mounten op /dlna/isos"
+section "STEP 3: Choose the data disk, format it and mount on /dlna/isos"
 
-info "Huidige schijven:"
+info "Current disks:"
 lsblk -f
 echo
 
-read -rp "Naam van de datadisk voor de ISO's, zonder /dev/ (bv. nvme0n1): " DATA_DISK
+read -rp "Name of the data disk for the ISOs, without /dev/ (e.g. nvme0n1): " DATA_DISK
 DATA_DISK_PATH="/dev/${DATA_DISK}"
 
 if [ ! -b "${DATA_DISK_PATH}" ]; then
-  err "${DATA_DISK_PATH} bestaat niet of is geen block-device."
+  err "${DATA_DISK_PATH} does not exist or is not a block device."
   exit 1
 fi
 
 CURRENT_ROOT_SRC=$(findmnt -n -o SOURCE / || true)
 CURRENT_ROOT_DISK=$(lsblk -no PKNAME "${CURRENT_ROOT_SRC}" 2>/dev/null || true)
 if [ "${DATA_DISK}" = "${CURRENT_ROOT_DISK}" ]; then
-  err "Dit is de schijf waar je nu vanaf boot! Kies de andere (data-)schijf."
+  err "That is the disk you are currently booted from! Choose the other (data) disk."
   exit 1
 fi
 
 echo
-info "Partities op ${DATA_DISK_PATH}:"
+info "Partitions on ${DATA_DISK_PATH}:"
 lsblk -f "${DATA_DISK_PATH}" || true
 echo
-warn "Alles op ${DATA_DISK_PATH} wordt hierbij ONHERROEPELIJK gewist."
-read -rp "Typ FORMAT om te bevestigen dat dit de juiste, te wissen schijf is: " FORMAT_CONFIRM
+warn "Everything on ${DATA_DISK_PATH} will be PERMANENTLY erased."
+read -rp "Type FORMAT to confirm this is the correct disk to wipe: " FORMAT_CONFIRM
 
 if [ "${FORMAT_CONFIRM}" != "FORMAT" ]; then
-  err "Niet bevestigd. Stoppen zonder de disk aan te passen."
+  err "Not confirmed. Stopping without touching the disk."
   exit 1
 fi
 
-info "Bestaande mounts van ${DATA_DISK_PATH} ontkoppelen (indien actief)..."
+info "Unmounting any existing mounts on ${DATA_DISK_PATH} (if active)..."
 for part in $(lsblk -ln -o NAME "${DATA_DISK_PATH}" | tail -n +2); do
   umount "/dev/${part}" 2>/dev/null || true
 done
 
-info "Schijf wissen en nieuwe GPT-partitietabel aanmaken..."
+info "Wiping disk and creating a new GPT partition table..."
 wipefs -a "${DATA_DISK_PATH}"
 parted -s "${DATA_DISK_PATH}" mklabel gpt
 parted -s "${DATA_DISK_PATH}" mkpart primary ext4 0% 100%
@@ -146,47 +154,74 @@ DATA_PART=$(lsblk -ln -o NAME "${DATA_DISK_PATH}" | sed -n '2p')
 DATA_PART_PATH="/dev/${DATA_PART}"
 
 if [ -z "${DATA_PART}" ] || [ ! -b "${DATA_PART_PATH}" ]; then
-  err "Kon de nieuwe partitie niet vinden op ${DATA_DISK_PATH}."
+  err "Could not find the new partition on ${DATA_DISK_PATH}."
   exit 1
 fi
 
-info "Nieuwe partitie: ${DATA_PART_PATH}"
-info "Formatteren als ext4 met label 'isos'..."
+info "New partition: ${DATA_PART_PATH}"
+info "Formatting as ext4 with label 'isos'..."
 mkfs.ext4 -F -L isos "${DATA_PART_PATH}"
 
-info "Mounten op /dlna/isos..."
+info "Mounting on /dlna/isos..."
 mount "${DATA_PART_PATH}" /dlna/isos
 
 DATA_UUID=$(blkid -s UUID -o value "${DATA_PART_PATH}")
 if [ -z "${DATA_UUID}" ]; then
-  err "Kon geen UUID vinden voor ${DATA_PART_PATH}, fstab-regel wordt overgeslagen."
+  err "Could not find a UUID for ${DATA_PART_PATH}, skipping fstab entry."
 else
   if grep -q "${DATA_UUID}" /etc/fstab; then
-    info "fstab bevat al een regel voor deze UUID, sla toevoegen over."
+    info "fstab already contains an entry for this UUID, skipping."
   else
-    # noatime/nodiratime: minder onnodige schrijfacties op de SSD bij het
-    # lezen van ISO's/scannen van de bibliotheek (zie stap 7 voor meer SSD-tuning)
+    # noatime/nodiratime: fewer unnecessary writes to the SSD while reading
+    # ISOs / scanning the library (see step 7 for more SSD tuning)
     echo "UUID=${DATA_UUID}  /dlna/isos  ext4  defaults,noatime,nodiratime,nofail  0  2" >> /etc/fstab
-    info "Regel toegevoegd aan /etc/fstab (met noatime voor minder schrijf-overhead)"
+    info "Entry added to /etc/fstab (with noatime to reduce write overhead)"
   fi
 fi
 
 df -h /dlna/isos
-info "Datadisk gereed en gemount op /dlna/isos"
+info "Data disk ready and mounted on /dlna/isos"
 
 # =========================================================================
-# STAP 4: docker-compose.yml genereren en container starten
+# STEP 4: Choose image source and generate docker-compose.yml
 # =========================================================================
-section "STAP 4: SACD Library docker-compose.yml genereren en starten"
+section "STEP 4: Choose image source, generate docker-compose.yml and start"
+
+DEFAULT_IMAGE="markklerkx/sacdlibrary:latest"
+
+echo "Which image source do you want to use for the SACD Library container?"
+echo "  1) Docker Hub (default): ${DEFAULT_IMAGE}"
+echo "  2) Custom registry (e.g. your own local registry, for faster pulls)"
+echo
+read -rp "Choice [1/2, default 1]: " REGISTRY_CHOICE
+REGISTRY_CHOICE="${REGISTRY_CHOICE:-1}"
+
+if [ "${REGISTRY_CHOICE}" = "2" ]; then
+  echo
+  echo "Enter the full image reference, including your registry host."
+  echo "Example: registry.local:5000/markklerkx/sacdlibrary:latest"
+  read -rp "Image reference: " CUSTOM_IMAGE
+  if [ -z "${CUSTOM_IMAGE}" ]; then
+    warn "No image reference entered, falling back to Docker Hub default."
+    IMAGE="${DEFAULT_IMAGE}"
+  else
+    IMAGE="${CUSTOM_IMAGE}"
+  fi
+else
+  IMAGE="${DEFAULT_IMAGE}"
+fi
+
+info "Using image: ${IMAGE}"
 
 COMPOSE_FILE="/dlna/docker-compose.yml"
 
-echo "Dit schrijft het volgende compose-bestand naar ${COMPOSE_FILE}:"
 echo
-cat <<'PREVIEW'
+echo "This will write the following compose file to ${COMPOSE_FILE}:"
+echo
+cat <<PREVIEW
 services:
   sacd-dlna:
-    image: markklerkx/sacdlibrary:latest
+    image: ${IMAGE}
     container_name: sacd-dlna
     restart: unless-stopped
     network_mode: host
@@ -206,14 +241,14 @@ services:
       - TZ=Europe/Amsterdam
 PREVIEW
 echo
-warn "Let op: netwerkmodus is 'host' — nodig voor UPnP/DLNA discovery (SSDP-broadcasts"
-warn "werken niet betrouwbaar achter Docker's standaard bridge-netwerk)."
+warn "Note: network mode is 'host' — required for UPnP/DLNA discovery (SSDP"
+warn "broadcasts don't work reliably behind Docker's default bridge network)."
 
-if confirm "Dit compose-bestand wegschrijven en de container starten?"; then
-  cat > "${COMPOSE_FILE}" <<'EOF'
+if confirm "Write this compose file and start the container?"; then
+  cat > "${COMPOSE_FILE}" <<EOF
 services:
   sacd-dlna:
-    image: markklerkx/sacdlibrary:latest
+    image: ${IMAGE}
     container_name: sacd-dlna
     restart: unless-stopped
     network_mode: host
@@ -232,34 +267,34 @@ services:
       - SACD_AUTO_SCAN_INTERVAL_SEC=3600
       - TZ=Europe/Amsterdam
 EOF
-  info "Compose-bestand geschreven naar ${COMPOSE_FILE}"
+  info "Compose file written to ${COMPOSE_FILE}"
 
-  info "Image pullen en container starten (dit kan even duren)..."
+  info "Pulling image and starting container (this may take a while)..."
   (cd /dlna && docker compose pull && docker compose up -d)
-  info "Container gestart. Status:"
+  info "Container started. Status:"
   docker ps --filter "name=sacd-dlna"
 else
-  warn "Overgeslagen. Je kunt dit later handmatig doen met:"
+  warn "Skipped. You can do this manually later with:"
   warn "  cd /dlna && docker compose up -d"
 fi
 
 # =========================================================================
-# STAP 5: Container-optimalisaties
+# STEP 5: Container optimizations
 # =========================================================================
-section "STAP 5: Optimalisaties voor de SACD-container"
+section "STEP 5: Optimizations for the SACD container"
 
-echo "Dit voegt de volgende optimalisaties toe aan ${COMPOSE_FILE}:"
-echo "  - logging: max 10MB per logbestand, max 3 bestanden (voorkomt volle schijf"
-echo "    door eindeloos groeiende container-logs)"
-echo "  - ulimits: nofile 65536 (nodig omdat de bibliotheek-scan mogelijk duizenden"
-echo "    ISO-bestanden tegelijk open moet kunnen hebben)"
-echo "  - fs.inotify.max_user_watches verhogen op de host (nodig zodat de container"
-echo "    changes in een grote ISO-collectie kan blijven detecteren zonder errors)"
+echo "This adds the following optimizations to ${COMPOSE_FILE}:"
+echo "  - logging: max 10MB per log file, max 3 files (prevents disk from"
+echo "    filling up with endlessly growing container logs)"
+echo "  - ulimits: nofile 65536 (needed because the library scan may need to"
+echo "    have thousands of ISO files open at the same time)"
+echo "  - increase fs.inotify.max_user_watches on the host (so the container"
+echo "    can keep detecting changes in a large ISO collection without errors)"
 echo
 
-if confirm "Deze optimalisaties toepassen?"; then
+if confirm "Apply these optimizations?"; then
   if [ -f "${COMPOSE_FILE}" ] && ! grep -q "ulimits:" "${COMPOSE_FILE}"; then
-    # Voeg logging + ulimits toe onder de service, met behoud van bestaande inhoud
+    # Insert logging + ulimits under the service, preserving existing content
     python3 - "${COMPOSE_FILE}" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -291,42 +326,42 @@ with open(path, "w") as f:
 
 print("inserted" if inserted else "not-inserted")
 PYEOF
-    info "logging + ulimits toegevoegd aan ${COMPOSE_FILE}"
+    info "logging + ulimits added to ${COMPOSE_FILE}"
   else
-    info "Optimalisaties staan al in het compose-bestand, of het bestand ontbreekt nog."
+    info "Optimizations are already present in the compose file, or the file doesn't exist yet."
   fi
 
   mkdir -p /etc/sysctl.d
   cat > /etc/sysctl.d/99-dlna.conf <<'EOF'
-# Verhoogde inotify-watches: nodig voor het live volgen van wijzigingen
-# in een grote ISO-bibliotheek zonder "no space left on device" inotify-errors.
+# Increased inotify watches: needed to live-track changes in a large ISO
+# library without hitting "no space left on device" inotify errors.
 fs.inotify.max_user_watches=1048576
 EOF
   sysctl --system >/dev/null 2>&1
-  info "fs.inotify.max_user_watches verhoogd naar 1048576"
+  info "fs.inotify.max_user_watches increased to 1048576"
 
   if [ -f "${COMPOSE_FILE}" ] && docker compose -f "${COMPOSE_FILE}" ps --status running 2>/dev/null | grep -q sacd-dlna; then
-    if confirm "Container herstarten om de nieuwe compose-instellingen toe te passen?"; then
+    if confirm "Restart the container to apply the new compose settings?"; then
       (cd /dlna && docker compose up -d)
-      info "Container herstart met nieuwe instellingen."
+      info "Container restarted with the new settings."
     fi
   fi
 else
-  info "Container-optimalisaties overgeslagen."
+  info "Container optimizations skipped."
 fi
 
 # =========================================================================
-# STAP 6: Fan-tuning voor de Raspberry Pi 5 Active Cooler
+# STEP 6: Fan tuning for the Raspberry Pi 5 Active Cooler
 # =========================================================================
-section "STAP 6: Fan-tuning (Raspberry Pi 5 Active Cooler)"
+section "STEP 6: Fan tuning (Raspberry Pi 5 Active Cooler)"
 
 CONFIG_TXT="/boot/firmware/config.txt"
 
-echo "Een 24/7-mediaserver in een gesloten behuizing profiteert van een iets"
-echo "eerder/agressiever aangezette fan-curve dan de Raspberry Pi-standaard,"
-echo "om te voorkomen dat de CPU tijdens library-scans/transcodes gaat throttlen."
+echo "A 24/7 media server in an enclosed case benefits from a slightly"
+echo "earlier/more aggressive fan curve than the Raspberry Pi default,"
+echo "to avoid the CPU throttling during library scans/transcodes."
 echo
-echo "Dit voegt de volgende regels toe aan ${CONFIG_TXT} (onder [all]):"
+echo "This adds the following lines to ${CONFIG_TXT} (under [all]):"
 cat <<'FANPREVIEW'
     dtparam=cooling_fan=on
     dtparam=fan_temp0=45000
@@ -343,20 +378,20 @@ cat <<'FANPREVIEW'
     dtparam=fan_temp3_speed=255
 FANPREVIEW
 echo
-warn "Alleen relevant als je de officiële Raspberry Pi 5 Active Cooler gebruikt."
-warn "Heb je een andere/geen fan? Sla deze stap dan over."
+warn "Only relevant if you're using the official Raspberry Pi 5 Active Cooler."
+warn "Using a different fan, or none at all? Skip this step."
 
-if confirm "Deze fan-curve toevoegen aan config.txt?"; then
+if confirm "Add this fan curve to config.txt?"; then
   if [ ! -f "${CONFIG_TXT}" ]; then
-    err "${CONFIG_TXT} niet gevonden, sla deze stap over."
+    err "${CONFIG_TXT} not found, skipping this step."
   elif grep -q "^dtparam=fan_temp0=" "${CONFIG_TXT}"; then
-    info "Er staat al een fan_temp0-instelling in config.txt, niks gewijzigd."
-    warn "Pas deze zo nodig handmatig aan in ${CONFIG_TXT}."
+    info "A fan_temp0 setting already exists in config.txt, nothing changed."
+    warn "Adjust it manually in ${CONFIG_TXT} if needed."
   else
     cp "${CONFIG_TXT}" "${CONFIG_TXT}.bak-$(date +%Y%m%d%H%M%S)"
     cat >> "${CONFIG_TXT}" <<'EOF'
 
-# --- SACD DLNA server: iets vroegere/agressievere fan-curve ---
+# --- SACD DLNA server: slightly earlier/more aggressive fan curve ---
 dtparam=cooling_fan=on
 dtparam=fan_temp0=45000
 dtparam=fan_temp0_hyst=5000
@@ -371,38 +406,38 @@ dtparam=fan_temp3=75000
 dtparam=fan_temp3_hyst=5000
 dtparam=fan_temp3_speed=255
 EOF
-    info "Fan-curve toegevoegd aan ${CONFIG_TXT} (backup ernaast opgeslagen)."
-    warn "Wordt pas actief na een reboot."
+    info "Fan curve added to ${CONFIG_TXT} (backup saved alongside it)."
+    warn "Takes effect only after a reboot."
   fi
 else
-  info "Fan-tuning overgeslagen."
+  info "Fan tuning skipped."
 fi
 
 # =========================================================================
-# STAP 7: Overige aanbevolen optimalisaties
+# STEP 7: Other recommended optimizations
 # =========================================================================
-section "STAP 7: Overige aanbevolen optimalisaties"
+section "STEP 7: Other recommended optimizations"
 
-echo "Dit voert de volgende extra optimalisaties door:"
-echo "  - fstrim.timer inschakelen: periodieke TRIM voor beide NVMe-schijven,"
-echo "    goed voor levensduur en schrijfprestaties van SSD's op de lange termijn"
-echo "  - vm.swappiness verlagen naar 10: voorkomt onnodig swappen naar de zram-swap"
-echo "    (je hebt RAM genoeg; liever cache in RAM houden dan wisselen)"
-echo "  - Docker's globale log-rotatie instellen in /etc/docker/daemon.json:"
-echo "    zodat OOK toekomstige containers (niet alleen sacd-dlna) nooit"
-echo "    ongelimiteerd logs kunnen schrijven en de schijf vol laten lopen"
+echo "This performs the following extra optimizations:"
+echo "  - enable fstrim.timer: periodic TRIM for both NVMe disks, good for"
+echo "    long-term SSD lifespan and write performance"
+echo "  - lower vm.swappiness to 10: avoids unnecessary swapping to the zram"
+echo "    swap (you have plenty of RAM; prefer keeping cache in RAM over swapping)"
+echo "  - set Docker's global log rotation in /etc/docker/daemon.json:"
+echo "    so future containers (not just sacd-dlna) can never write unlimited"
+echo "    logs and fill up the disk either"
 echo
 
-if confirm "Deze extra optimalisaties toepassen?"; then
+if confirm "Apply these extra optimizations?"; then
   systemctl enable --now fstrim.timer
-  info "fstrim.timer ingeschakeld (wekelijkse TRIM, standaard systemd-schema)"
+  info "fstrim.timer enabled (weekly TRIM, default systemd schedule)"
 
   if ! grep -q "vm.swappiness" /etc/sysctl.d/99-dlna.conf 2>/dev/null; then
     echo "vm.swappiness=10" >> /etc/sysctl.d/99-dlna.conf
     sysctl --system >/dev/null 2>&1
-    info "vm.swappiness ingesteld op 10"
+    info "vm.swappiness set to 10"
   else
-    info "vm.swappiness stond al ingesteld, niks gewijzigd."
+    info "vm.swappiness was already set, nothing changed."
   fi
 
   if [ ! -f /etc/docker/daemon.json ]; then
@@ -416,34 +451,35 @@ if confirm "Deze extra optimalisaties toepassen?"; then
   }
 }
 EOF
-    info "/etc/docker/daemon.json aangemaakt met globale log-rotatie"
-    if confirm "Docker herstarten om deze instelling toe te passen? (herstart alle containers)"; then
+    info "/etc/docker/daemon.json created with global log rotation"
+    if confirm "Restart Docker to apply this setting? (restarts all containers)"; then
       systemctl restart docker
-      info "Docker herstart."
+      info "Docker restarted."
     else
-      warn "Vergeet niet later: sudo systemctl restart docker"
+      warn "Don't forget later: sudo systemctl restart docker"
     fi
   else
-    info "/etc/docker/daemon.json bestaat al, niet overschreven (voorkomt conflicten)."
+    info "/etc/docker/daemon.json already exists, not overwritten (avoids conflicts)."
   fi
 else
-  info "Extra optimalisaties overgeslagen."
+  info "Extra optimizations skipped."
 fi
 
 # =========================================================================
-# Klaar
+# Done
 # =========================================================================
-section "Klaar"
+section "Done"
 
-info "Overzicht:"
-echo "  - Docker            : $(command -v docker >/dev/null 2>&1 && echo aanwezig || echo NIET geïnstalleerd)"
-echo "  - Mappen /dlna       : $([ -d /dlna/isos ] && echo aanwezig || echo ontbreken)"
-echo "  - Datadisk gemount   : $(mountpoint -q /dlna/isos && echo ja || echo nee) op /dlna/isos"
-echo "  - Compose-bestand    : ${COMPOSE_FILE}"
-echo "  - Container status   : $(docker ps --filter name=sacd-dlna --format '{{.Status}}' 2>/dev/null || echo 'niet gevonden')"
+info "Summary:"
+echo "  - Docker             : $(command -v docker >/dev/null 2>&1 && echo present || echo NOT installed)"
+echo "  - /dlna folders       : $([ -d /dlna/isos ] && echo present || echo missing)"
+echo "  - Data disk mounted  : $(mountpoint -q /dlna/isos && echo yes || echo no) on /dlna/isos"
+echo "  - Compose file       : ${COMPOSE_FILE}"
+echo "  - Image used         : ${IMAGE:-not set}"
+echo "  - Container status   : $(docker ps --filter name=sacd-dlna --format '{{.Status}}' 2>/dev/null || echo 'not found')"
 echo
-info "Als config.txt of daemon.json is aangepast: een reboot wordt aangeraden"
-info "om alle wijzigingen (fan-curve, Docker-logging) volledig te laten landen."
+info "If config.txt or daemon.json were changed: a reboot is recommended"
+info "to fully apply all changes (fan curve, Docker logging)."
 echo "    sudo reboot"
 echo
-info "Na de reboot is de webinterface te bereiken op: http://<pi-ip>:8080"
+info "After the reboot, the web interface will be available at: http://<pi-ip>:8080"
